@@ -1,0 +1,34 @@
+name: Manual publish module to bazel_registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (PEP 440, without leading 'v')."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bazel-registry-publish-manual:
+    name: publish to bazel_registry (review-based)
+
+    # Only canonical repo, only on main
+    if: >
+      github.repository_owner == 'eclipse-score' &&
+      github.ref == 'refs/heads/main'
+
+    # Access to review-based environment is based on manual approval
+    environment:
+      name: review-based
+
+    uses: eclipse-score/bazel_registry/.github/workflows/reusable-bazel-registry-publish.yml@main
+
+    with:
+      version: ${{ github.event.inputs.version }}
+
+    secrets:
+      # secret from environment
+      registry-token: ${{ secrets.REGISTRY_RW_TOKEN }}

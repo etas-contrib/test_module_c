@@ -1,0 +1,36 @@
+name: Auto publish module to bazel_registry
+
+on:
+  # Automatic: when a version tag is pushed
+  push:
+    tags:
+      - "v*"
+
+  # Automatic: when a GitHub Release is published
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  bazel-registry-publish-auto:
+    name: publish to bazel_registry (tags/releases)
+
+    # Only run on canonical repo
+    if: github.repository_owner == 'eclipse-score'
+
+    # Environment is only accessible on main branch and v* tags
+    # (configured in the repo settings; PR changes can't weaken this)
+    environment:
+      name: main-branch-or-tags
+
+    uses: eclipse-score/bazel_registry/.github/workflows/reusable-bazel-registry-publish.yml@main
+
+    with:
+      # Auto path always derives the tag from the event
+      version: ''
+
+    secrets:
+      # secret from environment
+      registry-token: ${{ secrets.REGISTRY_RW_TOKEN }}

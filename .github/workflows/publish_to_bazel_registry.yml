@@ -1,0 +1,209 @@
+# .github/workflows/reusable-bazel-registry-publish.yml
+#*******************************************************************************
+# Copyright (c) 2025 Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0
+#
+# SPDX-License-Identifier: Apache-2.0
+#*******************************************************************************
+name: Tag, Release & Publish to bazel_registry
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: >
+          Version (PEP 440 compatible, without leading "v").
+          Used when the triggering event is NOT a tag push or release.
+        required: false
+        type: string
+    secrets:
+      registry-token:
+        description: >
+          Token with write access to the bazel_registry repository.
+          Prefer a fine-grained PAT. Required to push branches / create PRs.
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # If an org/repo variable BAZEL_REGISTRY_REPOSITORY is set in the *caller* repo,
+  # use it. Otherwise default to eclipse-score/bazel_registry.
+  BAZEL_REGISTRY_REPOSITORY: ${{ vars.BAZEL_REGISTRY_REPOSITORY || 'eclipse-score/bazel_registry' }}
+
+jobs:
+  verify-tag:
+    name: Verify tag / release naming
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Determine tag
+        id: tag
+        run: |
+          set -euo pipefail
+
+          echo "Event name: ${{ github.event_name }}"
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "::debug:: Event is a tag push"
+
+            if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+              echo "::error:: Expected a tag ref, but got '${GITHUB_REF_TYPE}'"
+              exit 1
+            fi
+
+            # GITHUB_REF_NAME is usually just the tag name, but strip a possible prefix.
+            TAG="${GITHUB_REF_NAME#refs/tags/}"
+
+          elif [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "::debug:: Event is a release"
+            TAG="${{ github.event.release.tag_name }}"
+
+          else
+            echo "::debug:: Event is neither push nor release -> use inputs.version"
+            VERSION="${{ inputs.version }}"
+            if [[ -z "$VERSION" ]]; then
+              echo "::error:: inputs.version is required when event is not 'push' or 'release'"
+              exit 1
+            fi
+            TAG="v${VERSION}"
+          fi
+
+          echo "Tag: $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag matches PEP 440 (without leading 'v')
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${TAG#v}"
+
+          python -m pip install --quiet --upgrade packaging
+          python -c "from packaging.version import Version; Version('$VERSION')"
+
+      - name: Validate release name matches git tag
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          RELEASE_NAME="${{ github.event.release.name }}"
+          echo "Release Name: $RELEASE_NAME" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$RELEASE_NAME" != "$TAG"* ]]; then
+            echo "::error:: Release name '$RELEASE_NAME' does not start with tag '$TAG'"
+            exit 1
+          fi
+
+  create-registry-pr:
+    name: Create PR in bazel_registry
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    # Avoid overlapping updates for the same module repo + tag
+    concurrency:
+      group: bazel-registry-${{ github.repository }}-${{ needs.verify-tag.outputs.tag }}
+      cancel-in-progress: false
+
+    env:
+      REGISTRY_REPO: ${{ env.BAZEL_REGISTRY_REPOSITORY }}
+      TAG: ${{ needs.verify-tag.outputs.tag }}
+
+    steps:
+      # 1) Checkout caller repo to read MODULE.bazel
+      - name: Checkout module repository (caller)
+        uses: actions/checkout@v4
+
+      - name: Extract Bazel module name from MODULE.bazel
+        id: module
+        run: |
+          set -euo pipefail
+
+          FILE="MODULE.bazel"
+          if [[ ! -f "$FILE" ]]; then
+            echo "::error:: MODULE.bazel not found in repository root"
+            exit 1
+          fi
+
+          # Extract the 'name' attribute from the module() call.
+          MODULE_NAME=$(sed -n 's/.*module\s*(.*name\s*=\s*"\([^"]*\)".*/\1/p' "$FILE" | head -n 1)
+
+          if [[ -z "$MODULE_NAME" ]]; then
+            echo "::error:: Could not extract module(name = \"...\") from MODULE.bazel"
+            exit 1
+          fi
+
+          echo "Detected Bazel module name: $MODULE_NAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "module_name=$MODULE_NAME" >> "$GITHUB_OUTPUT"
+
+      # 2) Checkout bazel_registry repo into a subfolder
+      - name: Checkout bazel_registry
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REGISTRY_REPO }}
+          path: registry
+          token: ${{ secrets.registry-token }}
+
+      # 3) Setup Python for registry_manager
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install registry_manager
+        working-directory: registry
+        run: |
+          set -euo pipefail
+          python -m pip install .
+
+      # 4) Run registry_manager add <module> <tag> <repo> <sha>
+      - name: Update registry with registry_manager
+        working-directory: registry
+        env:
+          MODULE_NAME: ${{ steps.module.outputs.module_name }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          echo "Updating registry for $MODULE_NAME @ $TAG from $SOURCE_REPO@$SOURCE_SHA"
+
+          # Adjust this command once CLI is clear
+          python registry_manager add "$MODULE_NAME" "$TAG" "$SOURCE_REPO" "$SOURCE_SHA"
+
+      # 5) Create PR (TODO: Does a PR make sense or should we push directly to main?)
+      - name: Create pull request in bazel_registry
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.registry-token }}
+          path: registry
+          commit-message: "Add ${{ steps.module.outputs.module_name }} @ ${{ env.TAG }}"
+          branch: "update/${{ steps.module.outputs.module_name }}/${{ env.TAG }}"
+          title: "Add ${{ steps.module.outputs.module_name }} @ ${{ env.TAG }}"
+          body: |
+            This PR was created automatically.
+
+            **Module:** `${{ steps.module.outputs.module_name }}`
+            **Tag:** `${{ env.TAG }}`
+
+            **Source repository:** `${{ github.repository }}`
+            **Source commit:** `${{ github.sha }}`
+
+          labels: |
+            bazel-registry
+            automated
+          signoff: true
+
+      - name: Summarize PR
+        if: steps.cpr.outputs.pull-request-url != ''
+        run: |
+          echo "Created/updated PR: ${{ steps.cpr.outputs.pull-request-url }}" >> "$GITHUB_STEP_SUMMARY"
